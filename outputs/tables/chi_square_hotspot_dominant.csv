@@ -1,0 +1,6 @@
+﻿record_type,chi2_statistic,p_value,dof,is_significant_p_lt_0_05,interpretation,hotspot_status,dominant_group,count
+chi_square,17.561566188160167,2.7815370848062756e-05,1.0,1.0,p-value=2.782e-05로 0.05보다 작아 Hotspot/Non-hotspot 간 우세 축종 분포 차이는 통계적으로 유의합니다.,,,
+contingency,,,,,,hotspot,돼지,32
+contingency,,,,,,hotspot,소,6
+contingency,,,,,,non_hotspot,돼지,98
+contingency,,,,,,non_hotspot,소,116

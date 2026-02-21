@@ -1,1 +1,6 @@
-상위 15% 기여율: 30.4% | 핫스팟 우세 축종: 돼지 84.2%
+KPI 1: 상위 15 percent 지역이 전체 NH3 배출의 30.4 percent 차지
+KPI 2: Hotspot 평균 밀도는 Non-hotspot 대비 3.15 배 높음
+KPI 3: Hotspot 중 84.2 percent가 돼지 dominant
+
+민감도 해석: 구조적 집중도(기여율/지역비중) 기준으로 상위 10% 기준이 가장 집중 구조를 잘 보여줍니다 (index=2.19).
+카이제곱 해석: p-value=2.782e-05로 0.05보다 작아 Hotspot/Non-hotspot 간 우세 축종 분포 차이는 통계적으로 유의합니다.
