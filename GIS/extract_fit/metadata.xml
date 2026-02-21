@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xml:lang="ko"><Esri><CreaDate>20251223</CreaDate><CreaTime>15220900</CreaTime><ArcGISFormat>1.0</ArcGISFormat><SyncOnce>TRUE</SyncOnce><DataProperties><lineage><Process ToolSource="c:\program files (x86)\arcgis\desktop10.8\ArcToolbox\Toolboxes\Spatial Analyst Tools.tbx\ExtractByMask" Date="20251223" Time="152209">ExtractByMask nh3_2023.tif SIG C:\Users\JBNU11\Desktop\프로젝트\데이터\농도\extract_fit</Process></lineage></DataProperties></Esri></metadata>

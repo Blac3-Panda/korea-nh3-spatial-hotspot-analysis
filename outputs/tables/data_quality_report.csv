@@ -1,0 +1,10 @@
+﻿metric,value
+total_regions,252.0
+missing_emissions_count,0.0
+missing_emissions_ratio_pct,0.0
+missing_livestock_count,0.0
+missing_livestock_ratio_pct,0.0
+area_zero_or_negative_count,0.0
+area_min_km2,3.0388983164330763
+area_p99_km2,1494.1458101118192
+area_max_km2,1816.1574891790815
