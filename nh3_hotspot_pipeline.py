@@ -651,14 +651,6 @@ def make_maps(gdf: gpd.GeoDataFrame, out_fig_dir: Path, kmeans_meta: Dict[str, s
     save_choropleth(
         gdf,
         "density",
-        "시군구 NH3 배출밀도 (Full Scale)",
-        out_fig_dir / "map_density_fullscale.png",
-        "배출밀도 (kg/km²/yr)",
-    )
-
-    save_choropleth(
-        gdf,
-        "density",
         "시군구 NH3 배출밀도",
         out_fig_dir / "map_density_kgkm2yr.png",
         "배출밀도 (kg/km²/yr)",
