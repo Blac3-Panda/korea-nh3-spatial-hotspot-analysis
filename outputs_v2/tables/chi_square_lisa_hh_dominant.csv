@@ -1,0 +1,6 @@
+﻿record_type,chi2_statistic,p_value,dof,is_significant_p_lt_0_05,interpretation,group,dominant_group,count
+chi_square,2.0991677175283727,0.14737934250064483,1.0,0.0,p-value=0.1474; dominant distribution differs by LISA_HH status: not significant.,,,
+contingency,,,,,,LISA_HH,돼지,6
+contingency,,,,,,LISA_HH,소,1
+contingency,,,,,,Non_HH,돼지,124
+contingency,,,,,,Non_HH,소,121

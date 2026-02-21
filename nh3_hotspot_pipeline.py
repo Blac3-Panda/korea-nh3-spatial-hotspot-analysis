@@ -14,6 +14,8 @@ import pandas as pd
 from matplotlib import font_manager
 from matplotlib.patches import Patch
 from scipy.stats import chi2_contingency
+from esda import Moran, Moran_Local
+from libpysal.weights import Queen, Rook, w_subset
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
@@ -28,6 +30,14 @@ RANDOM_STATE = 42
 FIGURE_DPI = 320
 MAP_SIZE = (8, 10)
 CHART_SIZE = (8.2, 4.8)
+
+SPATIAL_SIDO_MAP = {
+    "11": "Seoul", "26": "Busan", "27": "Daegu", "28": "Incheon", "29": "Gwangju",
+    "30": "Daejeon", "31": "Ulsan", "36": "Sejong", "41": "Gyeonggi", "42": "Gangwon",
+    "43": "Chungbuk", "44": "Chungnam", "45": "Jeonbuk", "46": "Jeonnam", "47": "Gyeongbuk",
+    "48": "Gyeongnam", "50": "Jeju",
+}
+np.random.seed(RANDOM_STATE)
 
 
 def configure_plot_style() -> str:
@@ -688,6 +698,409 @@ def make_maps(gdf: gpd.GeoDataFrame, out_fig_dir: Path, kmeans_meta: Dict[str, s
     save_dominant_bar(gdf, "hotspot_p15", out_fig_dir / "bar_dominant_hotspot_vs_nonhotspot.png")
 
 
+
+
+def check_spatial_environment() -> None:
+    """Print environment check messages for spatial ESDA dependencies."""
+    print("\n[Spatial Environment]")
+    try:
+        import libpysal  # type: ignore
+        print(f"- libpysal: {libpysal.__version__}")
+    except Exception as exc:
+        print(f"- libpysal: unavailable ({exc})")
+    try:
+        import esda  # type: ignore
+        print(f"- esda: {esda.__version__}")
+    except Exception as exc:
+        print(f"- esda: unavailable ({exc})")
+
+
+def compute_spatial_weights(gdf: gpd.GeoDataFrame, method: str = "queen", silence_warnings: bool = False):
+    """
+    Create contiguity weights from geometry.
+    - method: queen (default) or rook
+    - row-standardized transform is applied
+    - returns cleaned gdf, weight object, and islands list
+    """
+    work = gdf.copy()
+    n_before = len(work)
+
+    work = work[work.geometry.notnull()].copy()
+    null_removed = n_before - len(work)
+
+    invalid_removed = 0
+    if len(work) > 0:
+        valid_mask = work.is_valid
+        invalid_removed = int((~valid_mask).sum())
+        work = work[valid_mask].copy()
+
+    method_lower = method.lower()
+    if method_lower == "queen":
+        w = Queen.from_dataframe(work, use_index=True, silence_warnings=True)
+    elif method_lower == "rook":
+        w = Rook.from_dataframe(work, use_index=True, silence_warnings=True)
+    else:
+        raise ValueError(f"Unsupported weights method: {method}. Use queen or rook.")
+
+    w.transform = "R"
+    islands = list(w.islands)
+
+    print("\n[Spatial Weights]")
+    print(f"- method: {method_lower}")
+    print(f"- geometry null removed: {null_removed}")
+    print(f"- geometry invalid removed: {invalid_removed}")
+    print(f"- islands count: {len(islands)}")
+
+    if islands and not silence_warnings:
+        print(f"- islands index preview: {islands[:10]}")
+        print("  warning: islands (no-neighbor polygons) are included by default.")
+
+    return work, w, islands
+
+
+def _align_y_and_w(gdf: gpd.GeoDataFrame, value_col: str, w):
+    """Drop missing y and subset weights to the same index order."""
+    if value_col not in gdf.columns:
+        raise KeyError(f"Column not found: {value_col}")
+
+    valid = gdf[value_col].notna()
+    g = gdf.loc[valid].copy()
+    dropped = int((~valid).sum())
+
+    if len(g) == 0:
+        raise ValueError(f"No valid rows for spatial variable: {value_col}")
+
+    if dropped > 0:
+        w_use = w_subset(w, list(g.index))
+    else:
+        w_use = w
+
+    w_use.transform = "R"
+    return g, w_use, dropped
+
+
+def global_moran(gdf: gpd.GeoDataFrame, value_col: str, w, permutations: int = 999):
+    """Compute global Moran's I for one variable."""
+    g, w_use, dropped = _align_y_and_w(gdf, value_col, w)
+    y = g[value_col].to_numpy()
+
+    np.random.seed(RANDOM_STATE)
+    moran = Moran(y, w_use, permutations=permutations)
+
+    result = {
+        "value_col": value_col,
+        "n": len(g),
+        "dropped_na_count": dropped,
+        "permutations": permutations,
+        "moran_i": float(moran.I),
+        "expected_i": float(moran.EI),
+        "z_score": float(moran.z_sim),
+        "p_value": float(moran.p_sim),
+    }
+
+    print(f"\n[Global Moran] {value_col}: I={result['moran_i']:.4f}, p={result['p_value']:.4g}")
+    return result, g, w_use, moran
+
+
+def local_moran(gdf: gpd.GeoDataFrame, value_col: str, w, permutations: int = 999, alpha: float = 0.05):
+    """Compute Local Moran (LISA) and assign cluster labels."""
+    g, w_use, dropped = _align_y_and_w(gdf, value_col, w)
+    y = g[value_col].to_numpy()
+
+    np.random.seed(RANDOM_STATE)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        li = Moran_Local(y, w_use, permutations=permutations, seed=RANDOM_STATE)
+
+    sig = li.p_sim < alpha
+    q = li.q
+
+    cluster = np.full(len(g), "Not significant", dtype=object)
+    cluster[sig & (q == 1)] = "HH"
+    cluster[sig & (q == 2)] = "LH"
+    cluster[sig & (q == 3)] = "LL"
+    cluster[sig & (q == 4)] = "HL"
+
+    ccol = f"lisa_cluster_{value_col}"
+    sig_col = f"lisa_sig_{value_col}"
+    hh_col = f"lisa_hh_{value_col}"
+
+    g[f"local_I_{value_col}"] = li.Is
+    g[f"local_p_sim_{value_col}"] = li.p_sim
+    g[f"local_q_{value_col}"] = li.q
+    g[sig_col] = sig
+    g[ccol] = cluster
+    g[hh_col] = sig & (q == 1)
+
+    sig_count = int(sig.sum())
+    hh_count = int(g[hh_col].sum())
+
+    print(f"\n[Local Moran] {value_col}: valid={len(g)}, dropped_na={dropped}, sig={sig_count}, HH={hh_count}")
+    return g, {"sig_count": sig_count, "hh_count": hh_count, "cluster_col": ccol, "hh_col": hh_col}, w_use, li
+
+
+def make_lisa_cluster_map(gdf: gpd.GeoDataFrame, cluster_col: str, outpath: Path, title: str) -> None:
+    """Draw LISA cluster map with standard ESDA palette."""
+    palette = {
+        "HH": "#d7191c",
+        "LL": "#2c7bb6",
+        "LH": "#abd9e9",
+        "HL": "#fdae61",
+        "Not significant": "#d9d9d9",
+    }
+    order = ["HH", "LL", "LH", "HL", "Not significant"]
+
+    fig, ax = plt.subplots(1, 1, figsize=MAP_SIZE)
+    for label in order:
+        sub = gdf[gdf[cluster_col] == label]
+        if len(sub) > 0:
+            sub.plot(ax=ax, color=palette[label], linewidth=0.25, edgecolor="#F8F8F8")
+
+    handles = [Patch(facecolor=palette[k], edgecolor="black", label=k) for k in order if (gdf[cluster_col] == k).any()]
+    ax.legend(handles=handles, loc="lower left")
+    ax.set_title(title)
+    ax.set_axis_off()
+    ax.set_facecolor("#EEF1F4")
+    fig.subplots_adjust(left=0.06, right=0.94, top=0.93, bottom=0.08)
+    fig.savefig(outpath, dpi=FIGURE_DPI)
+    plt.close(fig)
+
+
+def compare_hotspots(gdf: pd.DataFrame, p15_col: str, lisa_hh_col: str):
+    """Create 2x2 cross comparison between percentile hotspot and LISA HH."""
+    tmp = gdf[[p15_col, lisa_hh_col]].copy()
+    tmp[p15_col] = tmp[p15_col].fillna(False).astype(bool)
+    tmp[lisa_hh_col] = tmp[lisa_hh_col].fillna(False).astype(bool)
+
+    ctab = pd.crosstab(tmp[p15_col], tmp[lisa_hh_col]).reindex(index=[False, True], columns=[False, True], fill_value=0)
+
+    overlap = int(ctab.loc[True, True])
+    p15_total = int(ctab.loc[True].sum())
+    hh_total = int(ctab[True].sum())
+
+    p15_in_hh = (overlap / p15_total * 100) if p15_total > 0 else np.nan
+    hh_in_p15 = (overlap / hh_total * 100) if hh_total > 0 else np.nan
+
+    compare_df = (
+        ctab.stack()
+        .rename("count")
+        .reset_index()
+        .rename(columns={p15_col: "p15_hotspot", lisa_hh_col: "lisa_hh"})
+    )
+
+    metrics = {
+        "overlap_count": overlap,
+        "p15_total": p15_total,
+        "hh_total": hh_total,
+        "p15_in_hh_pct": p15_in_hh,
+        "hh_in_p15_pct": hh_in_p15,
+    }
+    return compare_df, metrics
+
+
+def chi_square_dominant(gdf: pd.DataFrame, hotspot_col: str, dominant_col: str):
+    """Chi-square test for dominant distribution by hotspot grouping."""
+    tmp = gdf[[hotspot_col, dominant_col]].copy()
+    tmp = tmp.dropna(subset=[dominant_col])
+    tmp["group"] = np.where(tmp[hotspot_col].fillna(False), "LISA_HH", "Non_HH")
+
+    ctab = pd.crosstab(tmp["group"], tmp[dominant_col])
+    if ctab.shape[0] < 2 or ctab.shape[1] < 2:
+        chi2_val = np.nan
+        p_val = np.nan
+        dof = 0
+        interpretation = "???? ??? ????? ??? ??? ?????."
+    else:
+        chi2_val, p_val, dof, _ = chi2_contingency(ctab)
+        interpretation = (
+            f"p-value={p_val:.4g}; dominant distribution differs by LISA_HH status: "
+            f"{'significant' if p_val < 0.05 else 'not significant'}."
+        )
+
+    stats_df = pd.DataFrame(
+        [
+            {
+                "chi2_statistic": chi2_val,
+                "p_value": p_val,
+                "dof": dof,
+                "is_significant_p_lt_0_05": bool(p_val < 0.05) if pd.notna(p_val) else False,
+                "interpretation": interpretation,
+            }
+        ]
+    )
+    ctab_long = ctab.stack().reset_index()
+    ctab_long.columns = ["group", "dominant_group", "count"]
+    return stats_df, ctab_long, interpretation
+
+
+def save_lisa_dominant_bar(gdf: pd.DataFrame, hotspot_col: str, dominant_col: str, out_png: Path) -> None:
+    tmp = gdf[[hotspot_col, dominant_col]].copy()
+    tmp["status"] = np.where(tmp[hotspot_col].fillna(False), "LISA_HH", "Non_HH")
+    dist = pd.crosstab(tmp["status"], tmp[dominant_col], normalize="index") * 100
+
+    status_order = ["LISA_HH", "Non_HH"]
+    col_order = [c for c in ["??", "?", "??", "??"] if c in dist.columns]
+    dist = dist.reindex(status_order).fillna(0.0)
+    if col_order:
+        dist = dist[col_order]
+
+    fig, ax = plt.subplots(figsize=CHART_SIZE)
+    dist.plot(kind="bar", stacked=True, ax=ax, width=0.48, color=["#D95C8A", "#6E4A35", "#54A24B", "#9E9E9E"])
+    ax.set_ylim(0, 100)
+    ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.3)
+    ax.set_ylabel("?? (%)")
+    ax.set_xlabel("")
+    ax.set_title("LISA HH vs Non-HH ?? ?? ??")
+    ax.set_xticklabels([str(x.get_text()) for x in ax.get_xticklabels()], rotation=0, ha="center")
+    ax.legend(title="dominant", loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
+    fig.subplots_adjust(left=0.12, right=0.82, top=0.88, bottom=0.15)
+    fig.savefig(out_png, dpi=FIGURE_DPI)
+    plt.close(fig)
+
+
+def summarize_lisa_hh_locations(gdf_lisa_density: gpd.GeoDataFrame, hh_col: str, top_n: int = 3) -> str:
+    hh = gdf_lisa_density[gdf_lisa_density[hh_col]].copy()
+    if len(hh) == 0:
+        return "No LISA HH regions detected for location summary."
+
+    hh["sido_code"] = hh["SIG_CD"].astype(str).str[:2]
+    hh["sido_name"] = hh["sido_code"].map(SPATIAL_SIDO_MAP).fillna("??")
+
+    top = hh["sido_name"].value_counts().head(top_n)
+    parts = [f"{name}({cnt})" for name, cnt in top.items()]
+    return "LISA HH is concentrated in: " + ", ".join(parts)
+
+
+def run_spatial_autocorrelation(gdf: gpd.GeoDataFrame, root: Path, weights_method: str = "queen", permutations: int = 999, alpha: float = 0.05, drop_islands: bool = False):
+    """Run ESDA workflow and save outputs in outputs_v2 without touching existing outputs."""
+    check_spatial_environment()
+
+    out_v2 = root / "outputs_v2"
+    out_fig = out_v2 / "figures"
+    out_tbl = out_v2 / "tables"
+    out_fig.mkdir(parents=True, exist_ok=True)
+    out_tbl.mkdir(parents=True, exist_ok=True)
+
+    gdf_spatial, w, islands = compute_spatial_weights(gdf, method=weights_method, silence_warnings=False)
+
+    if drop_islands and islands:
+        gdf_spatial = gdf_spatial.drop(index=islands).copy()
+        print(f"- drop_islands=True applied: removed {len(islands)} regions and recomputed weights")
+        gdf_spatial, w, islands = compute_spatial_weights(gdf_spatial, method=weights_method, silence_warnings=True)
+        print(f"- islands count after drop: {len(islands)}")
+
+    g_res_density, _, _, _ = global_moran(gdf_spatial, "density", w, permutations=permutations)
+    g_res_log, _, _, _ = global_moran(gdf_spatial, "log_density", w, permutations=permutations)
+
+    global_df = pd.DataFrame([g_res_density, g_res_log])
+    global_df.to_csv(out_tbl / "moran_global_summary.csv", index=False, encoding="utf-8-sig")
+
+    lisa_density, info_density, _, _ = local_moran(
+        gdf_spatial, "density", w, permutations=permutations, alpha=alpha
+    )
+    lisa_log, info_log, _, _ = local_moran(
+        gdf_spatial, "log_density", w, permutations=permutations, alpha=alpha
+    )
+
+    make_lisa_cluster_map(
+        lisa_density,
+        info_density["cluster_col"],
+        out_fig / "map_lisa_clusters_density.png",
+        "LISA Cluster Map (density)",
+    )
+    make_lisa_cluster_map(
+        lisa_log,
+        info_log["cluster_col"],
+        out_fig / "map_lisa_clusters_logdensity.png",
+        "LISA Cluster Map (log_density)",
+    )
+
+    density_cols = [
+        "SIG_CD", "SIG_KOR_NM", "density", "log_density",
+        "local_I_density", "local_p_sim_density", "local_q_density",
+        "lisa_sig_density", "lisa_cluster_density", "lisa_hh_density",
+    ]
+    log_cols = [
+        "SIG_CD", "SIG_KOR_NM", "density", "log_density",
+        "local_I_log_density", "local_p_sim_log_density", "local_q_log_density",
+        "lisa_sig_log_density", "lisa_cluster_log_density", "lisa_hh_log_density",
+    ]
+
+    lisa_density.loc[:, [c for c in density_cols if c in lisa_density.columns]].to_csv(
+        out_tbl / "lisa_local_results_density.csv", index=False, encoding="utf-8-sig"
+    )
+    lisa_log.loc[:, [c for c in log_cols if c in lisa_log.columns]].to_csv(
+        out_tbl / "lisa_local_results_logdensity.csv", index=False, encoding="utf-8-sig"
+    )
+
+    compare_base = gdf[["SIG_CD", "hotspot_p15", "dominant_group"]].copy()
+    compare_base = compare_base.merge(
+        lisa_density[["SIG_CD", "lisa_hh_density", "lisa_cluster_density"]],
+        on="SIG_CD",
+        how="left",
+    )
+    compare_base["lisa_hh_density"] = compare_base["lisa_hh_density"].map(lambda v: bool(v) if pd.notna(v) else False)
+
+    compare_df, overlap = compare_hotspots(compare_base, "hotspot_p15", "lisa_hh_density")
+    compare_df.to_csv(out_tbl / "compare_p15_vs_lisa_hh.csv", index=False, encoding="utf-8-sig")
+
+    print("\n[Hotspot Overlap: p15 vs LISA HH]")
+    print(f"- share of p15 that is LISA HH: {overlap['p15_in_hh_pct']:.1f}%")
+    print(f"- share of LISA HH that is p15: {overlap['hh_in_p15_pct']:.1f}%")
+
+    global_sig_sentence = (
+        "NH3 density shows statistically significant spatial clustering."
+        if g_res_density["p_value"] < 0.05
+        else "NH3 density does not show statistically significant spatial clustering."
+    )
+    location_sentence = summarize_lisa_hh_locations(lisa_density, "lisa_hh_density", top_n=3)
+    print("\n[Poster-ready sentences]")
+    print(global_sig_sentence)
+    print(location_sentence)
+
+    chi_stats, chi_ctab, chi_note = chi_square_dominant(compare_base, "lisa_hh_density", "dominant_group")
+
+    chi_stats_exp = chi_stats.copy()
+    chi_stats_exp["record_type"] = "chi_square"
+    chi_stats_exp["group"] = pd.NA
+    chi_stats_exp["dominant_group"] = pd.NA
+    chi_stats_exp["count"] = pd.NA
+
+    chi_ctab_exp = chi_ctab.copy()
+    chi_ctab_exp["record_type"] = "contingency"
+    chi_ctab_exp["chi2_statistic"] = np.nan
+    chi_ctab_exp["p_value"] = np.nan
+    chi_ctab_exp["dof"] = np.nan
+    chi_ctab_exp["is_significant_p_lt_0_05"] = np.nan
+    chi_ctab_exp["interpretation"] = pd.NA
+
+    chi_cols = [
+        "record_type", "chi2_statistic", "p_value", "dof", "is_significant_p_lt_0_05", "interpretation",
+        "group", "dominant_group", "count",
+    ]
+    pd.concat([chi_stats_exp[chi_cols], chi_ctab_exp[chi_cols]], ignore_index=True).to_csv(
+        out_tbl / "chi_square_lisa_hh_dominant.csv", index=False, encoding="utf-8-sig"
+    )
+
+    save_lisa_dominant_bar(compare_base, "lisa_hh_density", "dominant_group", out_fig / "bar_dominant_lisa_hh_vs_non.png")
+
+    print("\n[Spatial Summary Logs]")
+    print(f"1) weights method={weights_method}, islands={len(islands)}")
+    print(f"2) global Moran density I={g_res_density['moran_i']:.4f}, p={g_res_density['p_value']:.4g}")
+    print(f"   global Moran log_density I={g_res_log['moran_i']:.4f}, p={g_res_log['p_value']:.4g}")
+    print(f"3) local Moran significant count (density)={info_density['sig_count']}, (log_density)={info_log['sig_count']}")
+    print(f"4) LISA HH count (density)={info_density['hh_count']}")
+    print(f"5) overlap metrics: p15->HH={overlap['p15_in_hh_pct']:.1f}%, HH->p15={overlap['hh_in_p15_pct']:.1f}%")
+    print(f"6) dominant chi-square p-value={float(chi_stats.iloc[0]['p_value']):.4g}")
+
+    return {
+        "global_density": g_res_density,
+        "global_log_density": g_res_log,
+        "overlap": overlap,
+        "chi_square_note": chi_note,
+        "global_sentence": global_sig_sentence,
+        "location_sentence": location_sentence,
+        "outputs_v2": out_v2,
+    }
 def export_results(
     gdf: gpd.GeoDataFrame,
     quality_df: pd.DataFrame,
@@ -764,6 +1177,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Korea SIG NH3 hotspot analysis pipeline")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Project root path")
     parser.add_argument("--output", type=Path, default=Path.cwd() / "outputs", help="Output directory")
+    parser.add_argument("--weights-method", choices=["queen", "rook"], default="queen", help="Spatial weights method")
+    parser.add_argument("--moran-permutations", type=int, default=999, help="Permutation count for Moran tests")
+    parser.add_argument("--lisa-alpha", type=float, default=0.05, help="Significance alpha for LISA")
+    parser.add_argument("--drop-islands", action="store_true", help="Drop islands before Moran calculation")
     args = parser.parse_args()
 
     selected_font = configure_plot_style()
@@ -813,6 +1230,15 @@ def main() -> None:
     out_tbl = args.output / "tables"
     make_maps(gdf, out_fig, kmeans_meta, p15_threshold)
 
+    spatial_outputs = run_spatial_autocorrelation(
+        gdf=gdf,
+        root=args.root,
+        weights_method=args.weights_method,
+        permutations=args.moran_permutations,
+        alpha=args.lisa_alpha,
+        drop_islands=args.drop_islands,
+    )
+
     export_results(
         gdf=gdf,
         quality_df=quality_df,
@@ -830,6 +1256,7 @@ def main() -> None:
     print(f"- figures: {out_fig}")
     print(f"- tables: {out_tbl}")
     print(f"- kpi: {args.output / 'kpi_summary.txt'}")
+    print(f"- outputs_v2: {spatial_outputs['outputs_v2']}")
 
 
 if __name__ == "__main__":
